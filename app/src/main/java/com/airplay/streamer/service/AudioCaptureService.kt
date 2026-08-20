@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -14,14 +15,17 @@ import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import com.airplay.streamer.MainActivity
 import com.airplay.streamer.R
 import com.airplay.streamer.raop.RaopCapabilities
 import com.airplay.streamer.raop.RaopClient
 import com.airplay.streamer.util.LogServer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,7 +33,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlin.coroutines.coroutineContext
 
 /**
  * Foreground service that captures system audio using MediaProjection/AudioPlaybackCapture
@@ -68,9 +72,16 @@ class AudioCaptureService : Service() {
     private var audioRecord: AudioRecord? = null
     private var raopClient: RaopClient? = null
     private var captureJob: Job? = null
+    private var startupJob: Job? = null
+    private var projectionCallback: MediaProjection.Callback? = null
 
     private var isCapturing = false
+    private var isStarting = false
+    private var foregroundStarted = false
+    private var cleanupInProgress = false
     private var deviceName: String = "AirPlay Speaker"
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // Callback for UI updates
     var onStateChanged: ((Boolean) -> Unit)? = null
@@ -102,6 +113,9 @@ class AudioCaptureService : Service() {
 
                 if (resultData != null) {
                     startCapture(resultCode, resultData, host, port, featuresJson)
+                } else {
+                    reportFailure("MediaProjection consent result is missing")
+                    stopSelf()
                 }
             }
             ACTION_STOP -> {
@@ -113,27 +127,64 @@ class AudioCaptureService : Service() {
     }
 
     private fun startCapture(resultCode: Int, resultData: Intent, host: String, port: Int, featuresJson: String) {
-        if (isCapturing) return
+        if (isCapturing || isStarting) return
+        isStarting = true
 
-        // Start foreground with notification
-        startForeground(NOTIFICATION_ID, createNotification())
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                createNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            )
+            foregroundStarted = true
+            LogServer.log("AudioCaptureService foreground type: mediaProjection")
+        } catch (e: Exception) {
+            reportFailure("Foreground-service startup failed", e)
+            isStarting = false
+            stopSelf()
+            return
+        }
 
-        serviceScope.launch {
+        startupJob = serviceScope.launch {
             try {
-                // Get MediaProjection
-                val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) 
+                // The consent result is single-use on modern Android. This service only
+                // receives it once per start and never stores it for a later session.
+                val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
                     as MediaProjectionManager
-                mediaProjection = projectionManager.getMediaProjection(resultCode, resultData)
-
-                if (mediaProjection == null) {
+                val projection = try {
+                    projectionManager.getMediaProjection(resultCode, resultData)
+                } catch (e: Exception) {
+                    reportFailure("MediaProjection initialization failed", e)
+                    stopCapture()
                     stopSelf()
                     return@launch
                 }
 
-                LogServer.log("Protocol force: AirPlay 1 (RAOP)")
+                if (projection == null) {
+                    reportFailure("MediaProjection initialization failed: token was null")
+                    stopCapture()
+                    stopSelf()
+                    return@launch
+                }
+                mediaProjection = projection
+                val callback = object : MediaProjection.Callback() {
+                    override fun onStop() {
+                        LogServer.log("MediaProjection stopped by Android")
+                        stopCapture(projectionAlreadyStopped = true)
+                        stopSelf()
+                    }
+                }
+                projectionCallback = callback
+                try {
+                    projection.registerCallback(callback, mainHandler)
+                } catch (e: Exception) {
+                    reportFailure("MediaProjection initialization failed", e)
+                    stopCapture()
+                    stopSelf()
+                    return@launch
+                }
 
-                // AirPlay 1 (RAOP) Path
-                LogServer.log("Starting AirPlay 1 (RAOP) connection to $host:$port")
                 val deviceFeatures = featuresJson.split(";")
                     .mapNotNull { pair ->
                         val parts = pair.split("=", limit = 2)
@@ -142,10 +193,22 @@ class AudioCaptureService : Service() {
 
                 if (RaopCapabilities.requiresUnsupportedFairPlay(deviceFeatures)) {
                     LogServer.log(getString(R.string.fairplay_required_message, deviceName))
-                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopCapture()
                     stopSelf()
                     return@launch
                 }
+
+                // Build and start playback capture before opening RAOP. This makes an
+                // AudioRecord failure explicit and avoids opening a receiver we cannot feed.
+                if (!tryAudioPlaybackCapture()) {
+                    stopCapture()
+                    stopSelf()
+                    return@launch
+                }
+                if (!isStarting) return@launch
+
+                LogServer.log("Protocol force: AirPlay 1 (RAOP)")
+                LogServer.log("Starting AirPlay 1 (RAOP) connection to $host:$port")
 
                 raopClient = RaopClient(host, port, deviceFeatures)
                 
@@ -172,8 +235,9 @@ class AudioCaptureService : Service() {
                 val connected = raopClient?.connect() ?: false
 
                 if (!connected) {
-                    LogServer.log("Failed to connect to RAOP server")
+                    reportFailure("AirPlay/RAOP connection failed")
                     stopCapture()
+                    stopSelf()
                     return@launch
                 }
 
@@ -181,29 +245,33 @@ class AudioCaptureService : Service() {
                 // Set initial volume
                 raopClient?.setVolume(0.8f)
 
-                // Try AudioPlaybackCapture
-                val captureStarted = tryAudioPlaybackCapture()
-
-                if (captureStarted) {
-                    isCapturing = true
-                    onStateChanged?.invoke(true)
-                    LogServer.log("Audio capture started, beginning stream loop")
-                    startAudioStreamLoop()
-                } else {
-                    LogServer.log("Audio capture failed (possibly DRM blocked)")
-                    stopCapture()
-                }
+                if (!isStarting) return@launch
+                isStarting = false
+                isCapturing = true
+                onStateChanged?.invoke(true)
+                LogServer.log("Audio capture started, beginning stream loop")
+                startAudioStreamLoop()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                e.printStackTrace()
-                LogServer.log("Streaming/Pairing Error: ${e.message}")
+                reportFailure("Streaming startup failed", e)
                 stopCapture()
+                stopSelf()
+            } finally {
+                if (startupJob === coroutineContext[Job]) startupJob = null
             }
         }
     }
 
     private fun tryAudioPlaybackCapture(): Boolean {
+        val projection = mediaProjection
+        if (projection == null) {
+            reportFailure("Playback capture failed: MediaProjection is unavailable")
+            return false
+        }
+
         return try {
-            val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+            val config = AudioPlaybackCaptureConfiguration.Builder(projection)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .build()
@@ -227,14 +295,23 @@ class AudioCaptureService : Service() {
 
             if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
                 audioRecord?.startRecording()
+                if (audioRecord?.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    reportFailure("AudioRecord initialization failed: recording did not start")
+                    audioRecord?.release()
+                    audioRecord = null
+                    return false
+                }
                 true
             } else {
+                reportFailure("AudioRecord initialization failed: state=${audioRecord?.state}")
                 audioRecord?.release()
                 audioRecord = null
                 false
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            reportFailure("Playback capture initialization failed", e)
+            audioRecord?.release()
+            audioRecord = null
             false
         }
     }
@@ -243,77 +320,124 @@ class AudioCaptureService : Service() {
         captureJob = serviceScope.launch(Dispatchers.IO) {
             val buffer = ByteArray(BUFFER_SIZE)
 
-            while (isActive && isCapturing) {
-                val bytesRead = audioRecord?.read(buffer, 0, BUFFER_SIZE) ?: -1
+            try {
+                while (isActive && isCapturing) {
+                    val bytesRead = audioRecord?.read(buffer, 0, BUFFER_SIZE) ?: -1
 
-                if (bytesRead > 0) {
-                    raopClient?.streamAudio(buffer.copyOf(bytesRead))
-                } else if (bytesRead < 0) {
-                    // Error reading audio
-                    break
+                    if (bytesRead > 0) {
+                        raopClient?.streamAudio(buffer.copyOf(bytesRead))
+                    } else if (bytesRead < 0) {
+                        reportFailure("Playback capture read failed: $bytesRead")
+                        mainHandler.post {
+                            if (isCapturing) {
+                                stopCapture()
+                                stopSelf()
+                            }
+                        }
+                        break
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                reportFailure("RAOP audio streaming failed", e)
+                mainHandler.post {
+                    if (isCapturing) {
+                        stopCapture()
+                        stopSelf()
+                    }
                 }
             }
         }
     }
 
-    private fun stopCapture() {
-        if (!isCapturing && raopClient == null) return // Already stopped
-        
+    @Synchronized
+    private fun stopCapture(projectionAlreadyStopped: Boolean = false) {
+        if (cleanupInProgress) return
+        if (!isCapturing && !isStarting && mediaProjection == null &&
+            audioRecord == null && raopClient == null && captureJob == null && !foregroundStarted) {
+            return
+        }
+        cleanupInProgress = true
         LogServer.log("stopCapture() called - cleaning up")
-        
+
         // Pause media playback so audio doesn't continue on phone speaker
-        pauseMediaPlayback()
-        
-        // Set flag first to stop loops
+        if (isCapturing) pauseMediaPlayback()
+
+        isStarting = false
         isCapturing = false
-        
+
+        startupJob?.cancel()
+        startupJob = null
+
         // Cancel the capture job
         captureJob?.cancel()
         captureJob = null
 
         // Stop and release audio record
-        try {
-            audioRecord?.stop()
-        } catch (e: Exception) {
-            LogServer.log("Error stopping audioRecord: ${e.message}")
-        }
-        try {
-            audioRecord?.release()
-        } catch (e: Exception) {
-            LogServer.log("Error releasing audioRecord: ${e.message}")
-        }
+        val record = audioRecord
         audioRecord = null
+        try {
+            record?.stop()
+        } catch (e: Exception) {
+            LogServer.e(TAG, "Error stopping AudioRecord", e)
+        }
+        try {
+            record?.release()
+        } catch (e: Exception) {
+            LogServer.e(TAG, "Error releasing AudioRecord", e)
+        }
 
         // Disconnect clients in background to avoid blocking main thread
         // IMPORTANT: Clear callback first to prevent recursion (disconnect triggers callback -> triggers stopCapture)
-        raopClient?.callback = null
-        
+        val client = raopClient
+        raopClient = null
+        client?.callback = null
         serviceScope.launch(Dispatchers.IO) {
             try {
-                raopClient?.disconnect()
+                client?.disconnect()
             } catch (e: Exception) {
-                LogServer.log("Error disconnecting RAOP client: ${e.message}")
-            } finally {
-                raopClient = null
+                LogServer.e(TAG, "Error disconnecting RAOP client", e)
             }
         }
 
-        // Stop MediaProjection - this MUST be called to stop screen sharing indicator
-        try {
-            mediaProjection?.stop()
-            LogServer.log("MediaProjection stopped")
-        } catch (e: Exception) {
-            LogServer.log("Error stopping MediaProjection: ${e.message}")
-        }
+        val projection = mediaProjection
         mediaProjection = null
+        projectionCallback?.let { callback ->
+            try {
+                projection?.unregisterCallback(callback)
+            } catch (e: Exception) {
+                LogServer.e(TAG, "Error unregistering MediaProjection callback", e)
+            }
+        }
+        projectionCallback = null
+
+        if (projection != null && !projectionAlreadyStopped) {
+            try {
+                projection.stop()
+                LogServer.log("MediaProjection stopped")
+            } catch (e: Exception) {
+                LogServer.e(TAG, "Error stopping MediaProjection", e)
+            }
+        }
 
         // Notify UI
         onStateChanged?.invoke(false)
-        
+
         // Remove foreground notification
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        
+        if (foregroundStarted) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            foregroundStarted = false
+        }
+
+        cleanupInProgress = false
         LogServer.log("stopCapture() complete")
+    }
+
+    private fun reportFailure(category: String, throwable: Throwable? = null) {
+        val detail = throwable?.message?.takeIf { it.isNotBlank() }
+            ?: throwable?.javaClass?.simpleName
+        LogServer.e(TAG, if (detail == null) category else "$category: $detail", throwable)
     }
 
     private fun createNotificationChannel() {

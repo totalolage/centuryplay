@@ -4,6 +4,7 @@ import android.util.Log
 import com.airplay.streamer.util.LogServer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.bouncycastle.math.ec.rfc7748.X25519
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.DatagramPacket
@@ -11,6 +12,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.Socket
 import java.security.KeyFactory
+import java.security.SecureRandom
 import java.security.spec.RSAPublicKeySpec
 import java.math.BigInteger
 import javax.crypto.Cipher
@@ -106,14 +108,11 @@ class RaopClient(
         try {
             logD("Connecting to $host:$port")
 
-            // Connection 1: fp-setup × 2 + OPTIONS, then close — matches Apple Music's behaviour.
+            // Probe first, then open a fresh RTSP session for authentication and streaming.
             rtspSocket = Socket(host, port).apply { soTimeout = 5000 }
             localIp = rtspSocket!!.localAddress.hostAddress ?: "0.0.0.0"
             logD("RTSP socket connected, localIp=$localIp")
             rtspInput = rtspSocket!!.getInputStream()
-
-            logD("Connection 1: fp-setup...")
-            doFpSetup(mode = 0x00, requireValidPhase2 = false)
 
             logD("Testing OPTIONS...")
             val optionsResult = testOptions()
@@ -122,13 +121,22 @@ class RaopClient(
             rtspSocket?.close()
             cSeq.set(0)
 
-            // Connection 2: fp-setup × 2 + ANNOUNCE → SETUP → RECORD
+            // Connection 2: required authentication → ANNOUNCE → SETUP → RECORD
             rtspSocket = Socket(host, port).apply { soTimeout = 10000 }
             rtspInput = rtspSocket!!.getInputStream()
             logD("Reopened RTSP socket for ANNOUNCE")
 
-            logD("Connection 2: fp-setup...")
-            fairPlaySetupValid = doFpSetup(mode = 0x03, requireValidPhase2 = true)
+            if (useMfiAuthSetup) {
+                logD("Starting MFiSAP auth-setup...")
+                if (!doAuthSetup()) {
+                    logE("MFiSAP auth-setup failed")
+                    disconnect()
+                    return@withContext false
+                }
+                logD("MFiSAP auth-setup succeeded")
+            } else if (useFairPlayStub) {
+                fairPlaySetupValid = doFpSetup(mode = 0x03, requireValidPhase2 = true)
+            }
 
             // Create UDP sockets for audio/control/timing
             audioSocket = DatagramSocket()
@@ -167,6 +175,35 @@ class RaopClient(
             logE("Connection failed: ${e.message}")
             callback?.onError("Connection failed: ${e.message}")
             disconnect()
+            false
+        }
+    }
+
+    /**
+     * RAOP compatibility authentication advertised as et=4.
+     * The receiver only requires the ephemeral X25519 public key preflight;
+     * the returned MFi material is not used by the unencrypted et=0 stream.
+     */
+    private fun doAuthSetup(): Boolean {
+        return try {
+            val privateKey = ByteArray(X25519.SCALAR_SIZE)
+            val publicKey = ByteArray(X25519.POINT_SIZE)
+            X25519.generatePrivateKey(SecureRandom(), privateKey)
+            X25519.generatePublicKey(privateKey, 0, publicKey, 0)
+            val body = byteArrayOf(0x01) + publicKey
+            val headers = mapOf(
+                "Content-Type" to "application/octet-stream",
+                "Content-Length" to body.size.toString()
+            )
+
+            sendRtspRequestDirect("POST", "/auth-setup", headers, body)
+            val response = parseRtspResponse()
+            val responseLength = response?.second?.get("Content-Length")?.toIntOrNull() ?: 0
+            discardResponseBody(responseLength)
+            logD("auth-setup response: code=${response?.first}, length=$responseLength")
+            response?.first == 200
+        } catch (e: Exception) {
+            logE("auth-setup failed: ${e.message}")
             false
         }
     }
@@ -564,6 +601,7 @@ class RaopClient(
     private val supportedEncryptionTypes: Set<Int> =
         RaopCapabilities.encryptionTypes(deviceFeatures).ifEmpty { setOf(0, 1) }
     private val useFairPlayStub = RaopCapabilities.requiresUnsupportedFairPlay(deviceFeatures)
+    private val useMfiAuthSetup = RaopCapabilities.requiresMfiAuthSetup(deviceFeatures)
     private var useEncryption = 1 in supportedEncryptionTypes
 
     private fun buildSdp(localIp: String, rsaAesKey: String?, aesIvBase64: String?): String {

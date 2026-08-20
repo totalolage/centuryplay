@@ -16,4 +16,7 @@ object RaopCapabilities {
         val encryptionTypes = encryptionTypes(features)
         return 5 in encryptionTypes && 1 !in encryptionTypes
     }
+
+    fun requiresMfiAuthSetup(features: Map<String, String>): Boolean =
+        4 in encryptionTypes(features)
 }

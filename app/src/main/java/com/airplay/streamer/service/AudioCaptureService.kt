@@ -207,8 +207,13 @@ class AudioCaptureService : Service() {
                 }
                 if (!isStarting) return@launch
 
-                LogServer.log("Protocol force: AirPlay 1 (RAOP)")
-                LogServer.log("Starting AirPlay 1 (RAOP) connection to $host:$port")
+                val protocol = if (RaopCapabilities.requiresMfiAuthSetup(deviceFeatures)) {
+                    "RAOP compatibility (MFiSAP auth-setup)"
+                } else {
+                    "AirPlay 1 (RAOP)"
+                }
+                LogServer.log("Protocol: $protocol")
+                LogServer.log("Starting $protocol connection to $host:$port")
 
                 raopClient = RaopClient(host, port, deviceFeatures)
                 
@@ -393,7 +398,8 @@ class AudioCaptureService : Service() {
         val client = raopClient
         raopClient = null
         client?.callback = null
-        serviceScope.launch(Dispatchers.IO) {
+        // Receiver teardown must outlive this service's scope, which onDestroy cancels.
+        CoroutineScope(Dispatchers.IO).launch {
             try {
                 client?.disconnect()
             } catch (e: Exception) {

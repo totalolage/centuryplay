@@ -35,7 +35,4 @@
     
     <!-- Quick Settings Tile -->
     <string name="tile_label">centuryplay</string>
-    <string name="tile_connected">streaming to %s</string>
-    <string name="tile_disconnected">tap to stream</string>
-    <string name="select_speaker">select speaker</string>
 </resources>

@@ -43,13 +43,6 @@
             android:exported="false"
             android:theme="@style/Theme.AirPlayStreamer"/>
 
-        <activity
-            android:name=".TileDeviceActivity"
-            android:exported="false"
-            android:excludeFromRecents="true"
-            android:taskAffinity=""
-            android:theme="@style/Theme.AirPlayStreamer.Dialog" />
-
         <service
             android:name=".service.AudioCaptureService"
             android:foregroundServiceType="mediaProjection"

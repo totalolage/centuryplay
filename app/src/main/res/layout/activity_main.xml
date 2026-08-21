@@ -183,7 +183,7 @@
                         android:layout_height="wrap_content"
                         android:paddingHorizontal="16dp"
                         android:paddingVertical="8dp"
-                        android:text="tap a speaker to select it"
+                        android:text="tap speakers to select them"
                         android:textSize="12sp"
                         android:textColor="?attr/colorOnSurfaceVariant"
                         android:alpha="0.6"

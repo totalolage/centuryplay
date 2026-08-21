@@ -18,7 +18,7 @@ import kotlinx.coroutines.withContext
 
 data class MainUiState(
     val devices: List<AirPlayDevice> = emptyList(),
-    val selectedDevice: AirPlayDevice? = null,
+    val selectedDevices: List<AirPlayDevice> = emptyList(),
     val isStreaming: Boolean = false,
     val statusMessage: String = "searching for airplay speakers..."
 )
@@ -60,12 +60,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectDevice(device: AirPlayDevice) {
-        val current = _uiState.value.selectedDevice
-        if (current?.host == device.host && current.port == device.port) {
-            // Deselect
-            _uiState.value = _uiState.value.copy(selectedDevice = null)
+        val selected = _uiState.value.selectedDevices
+        val isSelected = selected.any { it.host == device.host && it.port == device.port }
+        if (isSelected) {
+            _uiState.value = _uiState.value.copy(
+                selectedDevices = selected.filterNot { it.host == device.host && it.port == device.port }
+            )
         } else {
-            _uiState.value = _uiState.value.copy(selectedDevice = device)
+            _uiState.value = _uiState.value.copy(selectedDevices = selected + device)
         }
     }
 

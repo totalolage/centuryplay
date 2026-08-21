@@ -37,20 +37,20 @@ class MainActivity : AppCompatActivity() {
     private val viewModel: MainViewModel by viewModels()
     private lateinit var speakerAdapter: SpeakerAdapter
 
-    private var pendingDevice: AirPlayDevice? = null
+    private var pendingDevices: List<AirPlayDevice> = emptyList()
     private var hasAttemptedAutoConnect = false
 
     private val mediaProjectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            pendingDevice?.let { device ->
-                startStreamingService(result.resultCode, result.data!!, device)
+            if (pendingDevices.isNotEmpty()) {
+                startStreamingService(result.resultCode, result.data!!, pendingDevices)
             }
         } else {
             Toast.makeText(this, "MediaProjection permission was denied or cancelled", Toast.LENGTH_SHORT).show()
         }
-        pendingDevice = null
+        pendingDevices = emptyList()
     }
 
     private val permissionLauncher = registerForActivityResult(
@@ -58,7 +58,7 @@ class MainActivity : AppCompatActivity() {
     ) { permissions ->
         val allGranted = permissions.values.all { it }
         if (allGranted) {
-            pendingDevice?.let { requestMediaProjection(it) }
+            if (pendingDevices.isNotEmpty()) requestMediaProjection(pendingDevices)
         } else {
             Toast.makeText(this, "Permissions required for audio capture", Toast.LENGTH_LONG).show()
         }
@@ -148,20 +148,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupRecyclerView() {
-        speakerAdapter = SpeakerAdapter { device ->
-            // Check if currently streaming
-            val isStreaming = AudioCaptureService.instance?.isCurrentlyStreaming() == true
-            val currentDevice = viewModel.uiState.value.selectedDevice
-            
-            if (isStreaming && currentDevice != null) {
-                // If tapping the same speaker that's playing, do nothing
-                if (currentDevice.host == device.host && currentDevice.port == device.port) {
-                    return@SpeakerAdapter
-                }
-                // Show confirmation dialog for switching to different speaker
-                showSwitchSpeakerDialog(device)
-            } else {
+        speakerAdapter = SpeakerAdapter speakerClick@{ device ->
+            val service = AudioCaptureService.instance
+            if (service?.isCurrentlyStreaming() != true) {
                 viewModel.selectDevice(device)
+                return@speakerClick
+            }
+
+            val selected = viewModel.uiState.value.selectedDevices
+            val isSelected = selected.any { it.host == device.host && it.port == device.port }
+            if (isSelected && selected.size == 1) {
+                Toast.makeText(this, "Keep at least one speaker selected", Toast.LENGTH_SHORT).show()
+                return@speakerClick
+            }
+            if (!isSelected && RaopCapabilities.requiresUnsupportedFairPlay(device.features)) {
+                showFairPlayUnsupportedDialog(device)
+                return@speakerClick
+            }
+
+            val updated = if (isSelected) {
+                selected.filterNot { it.host == device.host && it.port == device.port }
+            } else {
+                selected + device
+            }
+            if (service.updateReceivers(updated)) {
+                viewModel.selectDevice(device)
+                Toast.makeText(this, "Updating speaker group...", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Speaker group is already updating", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -173,19 +187,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    private fun showSwitchSpeakerDialog(newDevice: com.airplay.streamer.discovery.AirPlayDevice) {
-        com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
-            .setTitle("Switch Speaker?")
-            .setMessage("This will stop streaming to the current speaker and switch to ${newDevice.displayName}.")
-            .setPositiveButton("Switch") { _, _ ->
-                // Stop current stream and switch
-                stopStreaming()
-                viewModel.selectDevice(newDevice)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
     private fun setupControls() {
         // Play/Pause button
         binding.playPauseButton.setOnClickListener {
@@ -193,16 +194,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.streamButton.setOnClickListener {
-            val device = viewModel.uiState.value.selectedDevice
-            if (device == null) {
-                Toast.makeText(this, "Select a speaker first", Toast.LENGTH_SHORT).show()
+            val devices = viewModel.uiState.value.selectedDevices
+            if (devices.isEmpty()) {
+                Toast.makeText(this, "Select at least one speaker", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
 
             if (AudioCaptureService.instance?.isCurrentlyStreaming() == true) {
                 stopStreaming()
             } else {
-                checkPermissionsAndStart(device)
+                checkPermissionsAndStart(devices)
             }
         }
         
@@ -236,8 +237,9 @@ class MainActivity : AppCompatActivity() {
                     val items = state.devices.map { device ->
                         SpeakerAdapter.SpeakerItem(
                             device = device,
-                            isConnected = state.selectedDevice?.host == device.host &&
-                                         state.selectedDevice?.port == device.port
+                            isSelected = state.selectedDevices.any {
+                                it.host == device.host && it.port == device.port
+                            }
                         )
                     }
                     speakerAdapter.submitList(items)
@@ -250,8 +252,8 @@ class MainActivity : AppCompatActivity() {
                     binding.statusText.text = state.statusMessage
 
                     // Update stream button
-                    binding.streamButton.isEnabled = state.selectedDevice != null
-                    updateConnectedSpeakerUI(state.selectedDevice)
+                    binding.streamButton.isEnabled = state.selectedDevices.isNotEmpty()
+                    updateConnectedSpeakerUI(state.selectedDevices)
 
                     // Update streaming state
                     updateStreamingUI(state.isStreaming)
@@ -269,7 +271,7 @@ class MainActivity : AppCompatActivity() {
                                     hasAttemptedAutoConnect = true
                                     Toast.makeText(this@MainActivity, "Auto-connecting to ${match.displayName}...", Toast.LENGTH_SHORT).show()
                                     viewModel.selectDevice(match)
-                                    checkPermissionsAndStart(match)
+                                    checkPermissionsAndStart(listOf(match))
                                 }
                             }
                         }
@@ -314,10 +316,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateConnectedSpeakerUI(device: AirPlayDevice?) {
-        if (device != null) {
+    private fun updateConnectedSpeakerUI(devices: List<AirPlayDevice>) {
+        if (devices.isNotEmpty()) {
             binding.connectedSpeakerLayout.visibility = View.VISIBLE
-            binding.connectedSpeakerName.text = device.displayName.lowercase()
+            binding.connectedSpeakerName.text = devices.joinToString(", ") { it.displayName.lowercase() }
             // Hide protocol version chip for v1-only mode
             binding.protocolChip.visibility = View.GONE
         } else {
@@ -407,9 +409,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun checkPermissionsAndStart(device: AirPlayDevice) {
-        if (RaopCapabilities.requiresUnsupportedFairPlay(device.features)) {
-            showFairPlayUnsupportedDialog(device)
+    private fun checkPermissionsAndStart(devices: List<AirPlayDevice>) {
+        val unsupported = devices.firstOrNull {
+            RaopCapabilities.requiresUnsupportedFairPlay(it.features)
+        }
+        if (unsupported != null) {
+            showFairPlayUnsupportedDialog(unsupported)
             return
         }
 
@@ -423,9 +428,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (notGranted.isEmpty()) {
-            requestMediaProjection(device)
+            requestMediaProjection(devices)
         } else {
-            pendingDevice = device
+            pendingDevices = devices
             permissionLauncher.launch(notGranted.toTypedArray())
         }
     }
@@ -438,28 +443,41 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun requestMediaProjection(device: AirPlayDevice) {
-        pendingDevice = device
+    private fun requestMediaProjection(devices: List<AirPlayDevice>) {
+        pendingDevices = devices
         val projectionManager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
     }
 
-    private fun startStreamingService(resultCode: Int, data: Intent, device: AirPlayDevice) {
+    private fun startStreamingService(resultCode: Int, data: Intent, devices: List<AirPlayDevice>) {
         val serviceIntent = Intent(this, AudioCaptureService::class.java).apply {
             action = AudioCaptureService.ACTION_START
             putExtra(AudioCaptureService.EXTRA_RESULT_CODE, resultCode)
             putExtra(AudioCaptureService.EXTRA_RESULT_DATA, data)
-            putExtra(AudioCaptureService.EXTRA_HOST, device.host)
-            putExtra(AudioCaptureService.EXTRA_PORT, device.raopPort ?: device.port)
-            putExtra(AudioCaptureService.EXTRA_DEVICE_NAME, device.displayName)
-            putExtra(AudioCaptureService.EXTRA_DEVICE_FEATURES,
-                device.features.entries.joinToString(";") { "${it.key}=${it.value}" })
+            putStringArrayListExtra(
+                AudioCaptureService.EXTRA_HOSTS,
+                ArrayList(devices.map { it.host })
+            )
+            putExtra(
+                AudioCaptureService.EXTRA_PORTS,
+                devices.map { it.raopPort ?: it.port }.toIntArray()
+            )
+            putStringArrayListExtra(
+                AudioCaptureService.EXTRA_DEVICE_NAMES,
+                ArrayList(devices.map { it.displayName })
+            )
+            putStringArrayListExtra(
+                AudioCaptureService.EXTRA_DEVICE_FEATURES_LIST,
+                ArrayList(devices.map { device ->
+                    device.features.entries.joinToString(";") { "${it.key}=${it.value}" }
+                })
+            )
         }
         
         // Save Last Device for Auto-Connect
         getSharedPreferences(SettingsActivity.PREFS_NAME, MODE_PRIVATE).edit()
-            .putString("last_device_host", device.host)
-            .putInt("last_device_port", device.port)
+            .putString("last_device_host", devices.first().host)
+            .putInt("last_device_port", devices.first().port)
             .apply()
 
         startForegroundService(serviceIntent)

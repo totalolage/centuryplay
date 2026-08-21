@@ -19,7 +19,7 @@ class SpeakerAdapter(
 
     data class SpeakerItem(
         val device: AirPlayDevice,
-        val isConnected: Boolean = false
+        val isSelected: Boolean = false
     )
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
@@ -52,7 +52,7 @@ class SpeakerAdapter(
             val density = itemView.resources.displayMetrics.density
             
             // Set stroke immediately without animation (prevents RecyclerView crash on rapid tapping)
-            val targetStrokeWidth = if (item.isConnected) (3 * density).toInt() else 0
+            val targetStrokeWidth = if (item.isSelected) (3 * density).toInt() else 0
             
             card.strokeColor = colorPrimary
             card.setStrokeColor(ColorStateList.valueOf(colorPrimary))

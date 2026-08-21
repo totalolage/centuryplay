@@ -1,94 +1,52 @@
 package com.airplay.streamer.raop
 
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-
-/**
- * Simple ALAC (Apple Lossless Audio Codec) encoder for AirPlay 1
- * 
- * For AirPlay 1, we can use uncompressed ALAC frames which are accepted
- * by most receivers. This is a simplified implementation that wraps PCM
- * data in ALAC frame format.
- */
+/** Encodes one 352-frame, 16-bit stereo PCM packet as uncompressed ALAC. */
 class AlacEncoder {
     companion object {
         private const val FRAMES_PER_PACKET = 352
-        private const val CHANNELS = 2
-        private const val BITS_PER_SAMPLE = 16
-        private const val BYTES_PER_SAMPLE = BITS_PER_SAMPLE / 8
-        private const val BYTES_PER_FRAME = CHANNELS * BYTES_PER_SAMPLE
+        private const val BYTES_PER_FRAME = 4
+        private const val PCM_PACKET_SIZE = FRAMES_PER_PACKET * BYTES_PER_FRAME
     }
 
-    /**
-     * Encode PCM audio data to ALAC format
-     * Input: 16-bit stereo PCM, 44100Hz, little-endian
-     * Output: ALAC frame suitable for RTP streaming
-     */
+    /** Input is interleaved little-endian PCM. */
     fun encode(pcmData: ByteArray): ByteArray {
-        // For simplicity, we use uncompressed ALAC mode
-        // This is less efficient but widely compatible
-        
-        val numSamples = pcmData.size / BYTES_PER_FRAME
-        
-        // ALAC packet header for uncompressed mode
-        // Format: 1 byte header + PCM data (converted to big-endian)
-        val header = buildAlacHeader(numSamples)
-        
-        // Convert PCM from little-endian to big-endian (network byte order)
-        val bigEndianPcm = convertToBigEndian(pcmData)
-        
-        return header + bigEndianPcm
-    }
+        require(pcmData.size == PCM_PACKET_SIZE)
 
-    private fun buildAlacHeader(numSamples: Int): ByteArray {
-        // ALAC uncompressed frame header
-        // Bit layout:
-        // [0:2] = 001 (uncompressed)
-        // [3:11] = reserved
-        // [12] = has size flag (1 if not standard size)
-        // [13] = unused high bit
-        // [14:15] = unused
-        // [16:31] = sample count (if has size flag = 1)
-        
-        return if (numSamples == FRAMES_PER_PACKET) {
-            // Standard size - just 3 bytes header
-            byteArrayOf(
-                0x20.toByte(), // Uncompressed, no size field
-                0x00.toByte(),
-                0x00.toByte()
-            )
-        } else {
-            // Non-standard size - include sample count
-            val buffer = ByteBuffer.allocate(7)
-            buffer.order(ByteOrder.BIG_ENDIAN)
-            
-            // Header with hasSize flag
-            buffer.put(0x24.toByte())
-            buffer.putShort(0)
-            buffer.putInt(numSamples)
-            
-            buffer.array()
-        }
-    }
+        // ALAC's uncompressed stereo frame is bit-aligned; the first sample's
+        // sign bit shares the final byte of the frame-count header. Framing follows
+        // airplay-cli's GPL-3.0 pcm_to_alac_raw reference implementation.
+        val output = ByteArray(8 + PCM_PACKET_SIZE)
+        var out = 0
+        output[out++] = 0x20
+        output[out++] = 0
+        output[out++] = 0x12
+        val frameBits = FRAMES_PER_PACKET shl 1
+        output[out++] = (frameBits ushr 24).toByte()
+        output[out++] = (frameBits ushr 16).toByte()
+        output[out++] = (frameBits ushr 8).toByte()
+        output[out++] = (frameBits or (sample(pcmData, 0) ushr 15)).toByte()
 
-    private fun convertToBigEndian(pcmData: ByteArray): ByteArray {
-        val result = ByteArray(pcmData.size)
-        
-        // Swap bytes for each 16-bit sample
-        for (i in pcmData.indices step 2) {
-            if (i + 1 < pcmData.size) {
-                result[i] = pcmData[i + 1]
-                result[i + 1] = pcmData[i]
+        for (frame in 0 until FRAMES_PER_PACKET) {
+            val left = sample(pcmData, frame * BYTES_PER_FRAME)
+            val right = sample(pcmData, frame * BYTES_PER_FRAME + 2)
+            val nextLeftSign = if (frame + 1 < FRAMES_PER_PACKET) {
+                sample(pcmData, (frame + 1) * BYTES_PER_FRAME) ushr 15
+            } else {
+                0
             }
+            output[out++] = ((left and 0x7f80) ushr 7).toByte()
+            output[out++] = (((left and 0x7f) shl 1) or (right ushr 15)).toByte()
+            output[out++] = ((right and 0x7f80) ushr 7).toByte()
+            output[out++] = (((right and 0x7f) shl 1) or nextLeftSign).toByte()
         }
-        
-        return result
+
+        output[out - 1] = (output[out - 1].toInt() or 1).toByte()
+        output[out] = 0xc0.toByte()
+        return output
     }
 
-    /**
-     * Get the expected PCM buffer size for one ALAC packet
-     */
-    fun getExpectedPcmSize(): Int {
-        return FRAMES_PER_PACKET * BYTES_PER_FRAME
-    }
+    fun getExpectedPcmSize(): Int = PCM_PACKET_SIZE
+
+    private fun sample(data: ByteArray, offset: Int): Int =
+        (data[offset].toInt() and 0xff) or ((data[offset + 1].toInt() and 0xff) shl 8)
 }

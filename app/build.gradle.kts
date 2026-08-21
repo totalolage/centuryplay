@@ -91,4 +91,6 @@ dependencies {
     
     // Bouncy Castle for SRP-6a crypto (AirPlay 2 Pairing)
     implementation("org.bouncycastle:bcprov-jdk15on:1.70")
+
+    testImplementation("junit:junit:4.13.2")
 }

@@ -88,7 +88,7 @@ class TileDeviceActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.uiState.collect { state ->
                     val items = state.devices.map { device ->
-                        SpeakerAdapter.SpeakerItem(device = device, isConnected = false)
+                        SpeakerAdapter.SpeakerItem(device = device, isSelected = false)
                     }
                     speakerAdapter.submitList(items)
                     binding.emptyView.visibility = if (state.devices.isEmpty()) View.VISIBLE else View.GONE

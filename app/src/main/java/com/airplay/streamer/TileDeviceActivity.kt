@@ -41,7 +41,7 @@ class TileDeviceActivity : AppCompatActivity() {
                 startStreamingService(result.resultCode, result.data!!, device)
             }
         } else {
-            Toast.makeText(this, "Permission denied", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "MediaProjection permission was denied or cancelled", Toast.LENGTH_SHORT).show()
         }
         finish()
     }
@@ -88,7 +88,7 @@ class TileDeviceActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 viewModel.uiState.collect { state ->
                     val items = state.devices.map { device ->
-                        SpeakerAdapter.SpeakerItem(device = device, isConnected = false)
+                        SpeakerAdapter.SpeakerItem(device = device, isSelected = false)
                     }
                     speakerAdapter.submitList(items)
                     binding.emptyView.visibility = if (state.devices.isEmpty()) View.VISIBLE else View.GONE

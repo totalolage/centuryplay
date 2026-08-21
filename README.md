@@ -88,7 +88,7 @@ bottom line: excellent quality, but not bit-perfect hi-res. cd quality (16-bit/4
 
 ### from release
 
-download the latest apk from the [releases](https://github.com/g8row/centuryplay/releases) page.
+download the latest apk from the [releases](https://github.com/totalolage/centuryplay/releases) page.
 
 ## usage
 

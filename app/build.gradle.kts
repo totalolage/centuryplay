@@ -3,6 +3,19 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val releaseKeystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
+val releaseKeystorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+val releaseKeyAlias = System.getenv("ANDROID_KEY_ALIAS")
+val releaseKeyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+val appVersionCode = System.getenv("APP_VERSION_CODE")?.toIntOrNull() ?: 3
+val appVersionName = System.getenv("APP_VERSION_NAME") ?: "1.0"
+val canSignRelease = listOf(
+    releaseKeystorePath,
+    releaseKeystorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.airplay.streamer"
     compileSdk = 35
@@ -11,8 +24,19 @@ android {
         applicationId = "com.airplay.streamer"
         minSdk = 29  // Android 10+ required for AudioPlaybackCapture
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
+    }
+
+    signingConfigs {
+        if (canSignRelease) {
+            create("ciRelease") {
+                storeFile = file(requireNotNull(releaseKeystorePath))
+                storePassword = requireNotNull(releaseKeystorePassword)
+                keyAlias = requireNotNull(releaseKeyAlias)
+                keyPassword = requireNotNull(releaseKeyPassword)
+            }
+        }
     }
 
     buildTypes {
@@ -26,6 +50,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (canSignRelease) {
+                signingConfig = signingConfigs.getByName("ciRelease")
+            }
         }
     }
 
@@ -64,4 +91,6 @@ dependencies {
     
     // Bouncy Castle for SRP-6a crypto (AirPlay 2 Pairing)
     implementation("org.bouncycastle:bcprov-jdk15on:1.70")
+
+    testImplementation("junit:junit:4.13.2")
 }

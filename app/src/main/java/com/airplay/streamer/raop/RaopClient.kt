@@ -4,6 +4,7 @@ import android.util.Log
 import com.airplay.streamer.util.LogServer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.bouncycastle.math.ec.rfc7748.X25519
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.DatagramPacket
@@ -11,6 +12,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.Socket
 import java.security.KeyFactory
+import java.security.SecureRandom
 import java.security.spec.RSAPublicKeySpec
 import java.math.BigInteger
 import javax.crypto.Cipher
@@ -25,10 +27,16 @@ import kotlin.random.Random
  * RAOP (Remote Audio Output Protocol) client for AirPlay 1 speakers
  * Implements the RTSP-based protocol for audio streaming
  */
+data class RaopStreamClock(
+    val initialRtpTimestamp: Long,
+    val epochMs: Long
+)
+
 class RaopClient(
     private val host: String,
     private val port: Int,
-    private val deviceFeatures: Map<String, String> = emptyMap()
+    private val deviceFeatures: Map<String, String> = emptyMap(),
+    private val streamClock: RaopStreamClock? = null
 ) {
     companion object {
         private const val TAG = "RaopClient"
@@ -46,6 +54,7 @@ class RaopClient(
 
     private var rtspSocket: Socket? = null
     private var rtspInput: InputStream? = null
+    private val rtspLock = Any()
     private var audioSocket: DatagramSocket? = null
     private var controlSocket: DatagramSocket? = null
     private var timingSocket: DatagramSocket? = null
@@ -71,9 +80,13 @@ class RaopClient(
 
     private val isConnected = AtomicBoolean(false)
     private val isStreaming = AtomicBoolean(false)
+    private val loggedFirstAudioPacket = AtomicBoolean(false)
+    private val loggedFirstTimingRequest = AtomicBoolean(false)
+    private val loggedFirstSyncPacket = AtomicBoolean(false)
 
     private var rtpSequence: Int = Random.nextInt(0xFFFF)
-    private var rtpTimestamp: Long = Random.nextLong(0xFFFFFFFFL)
+    private var rtpTimestamp: Long = streamClock?.initialRtpTimestamp
+        ?: Random.nextLong(0xFFFFFFFFL)
     private val ssrc: Int = Random.nextInt()
     private val alacEncoder = AlacEncoder()
 
@@ -106,14 +119,11 @@ class RaopClient(
         try {
             logD("Connecting to $host:$port")
 
-            // Connection 1: fp-setup × 2 + OPTIONS, then close — matches Apple Music's behaviour.
+            // Probe first, then open a fresh RTSP session for authentication and streaming.
             rtspSocket = Socket(host, port).apply { soTimeout = 5000 }
             localIp = rtspSocket!!.localAddress.hostAddress ?: "0.0.0.0"
             logD("RTSP socket connected, localIp=$localIp")
             rtspInput = rtspSocket!!.getInputStream()
-
-            logD("Connection 1: fp-setup...")
-            doFpSetup(mode = 0x00, requireValidPhase2 = false)
 
             logD("Testing OPTIONS...")
             val optionsResult = testOptions()
@@ -122,13 +132,22 @@ class RaopClient(
             rtspSocket?.close()
             cSeq.set(0)
 
-            // Connection 2: fp-setup × 2 + ANNOUNCE → SETUP → RECORD
+            // Connection 2: required authentication → ANNOUNCE → SETUP → RECORD
             rtspSocket = Socket(host, port).apply { soTimeout = 10000 }
             rtspInput = rtspSocket!!.getInputStream()
             logD("Reopened RTSP socket for ANNOUNCE")
 
-            logD("Connection 2: fp-setup...")
-            fairPlaySetupValid = doFpSetup(mode = 0x03, requireValidPhase2 = true)
+            if (useMfiAuthSetup) {
+                logD("Starting MFiSAP auth-setup...")
+                if (!doAuthSetup()) {
+                    logE("MFiSAP auth-setup failed")
+                    disconnect()
+                    return@withContext false
+                }
+                logD("MFiSAP auth-setup succeeded")
+            } else if (useFairPlayStub) {
+                fairPlaySetupValid = doFpSetup(mode = 0x03, requireValidPhase2 = true)
+            }
 
             // Create UDP sockets for audio/control/timing
             audioSocket = DatagramSocket()
@@ -167,6 +186,35 @@ class RaopClient(
             logE("Connection failed: ${e.message}")
             callback?.onError("Connection failed: ${e.message}")
             disconnect()
+            false
+        }
+    }
+
+    /**
+     * RAOP compatibility authentication advertised as et=4.
+     * The receiver only requires the ephemeral X25519 public key preflight;
+     * the returned MFi material is not used by the unencrypted et=0 stream.
+     */
+    private fun doAuthSetup(): Boolean {
+        return try {
+            val privateKey = ByteArray(X25519.SCALAR_SIZE)
+            val publicKey = ByteArray(X25519.POINT_SIZE)
+            X25519.generatePrivateKey(SecureRandom(), privateKey)
+            X25519.generatePublicKey(privateKey, 0, publicKey, 0)
+            val body = byteArrayOf(0x01) + publicKey
+            val headers = mapOf(
+                "Content-Type" to "application/octet-stream",
+                "Content-Length" to body.size.toString()
+            )
+
+            sendRtspRequestDirect("POST", "/auth-setup", headers, body)
+            val response = parseRtspResponse()
+            val responseLength = response?.second?.get("Content-Length")?.toIntOrNull() ?: 0
+            discardResponseBody(responseLength)
+            logD("auth-setup response: code=${response?.first}, length=$responseLength")
+            response?.first == 200
+        } catch (e: Exception) {
+            logE("auth-setup failed: ${e.message}")
             false
         }
     }
@@ -410,6 +458,7 @@ class RaopClient(
         val response = parseRtspResponse()
         if (response != null && response.first == 200) {
             val transportHeader = response.second["Transport"] ?: return false
+            logD("SETUP transport from $host: $transportHeader")
             parseTransportHeader(transportHeader)
             
             val sessionVal = response.second["Session"]
@@ -439,7 +488,7 @@ class RaopClient(
 
     suspend fun streamAudio(pcmData: ByteArray) = withContext(Dispatchers.IO) {
         if (!isStreaming.get() || audioSocket == null) return@withContext
-        val packetSize = if (useFairPlayStub) alacEncoder.getExpectedPcmSize() else 1408
+        val packetSize = alacEncoder.getExpectedPcmSize()
         
         synchronized(audioBuffer) {
             audioBuffer.write(pcmData)
@@ -450,17 +499,20 @@ class RaopClient(
             var offset = 0
             while (offset + packetSize <= bufferBytes.size) {
                 val chunk = bufferBytes.copyOfRange(offset, offset + packetSize)
-                val payloadData = if (useFairPlayStub) {
+                val payloadData = if (useAlac) {
                     alacEncoder.encode(chunk)
                 } else {
                     val beData = swapEndianness(chunk)
                     if (useEncryption) encryptAudio(beData) else beData
                 }
                 
-                val rtpPacket = buildRtpPacket(payloadData)
+                val rtpPacket = buildRtpPacket(payloadData, !loggedFirstAudioPacket.get())
                 val address = InetAddress.getByName(host)
                 val packet = DatagramPacket(rtpPacket, rtpPacket.size, address, serverPort)
                 audioSocket?.send(packet)
+                if (loggedFirstAudioPacket.compareAndSet(false, true)) {
+                    logD("First audio packet to $host:$serverPort: bytes=${rtpPacket.size}, seq=$rtpSequence, rtptime=$rtpTimestamp")
+                }
 
                 rtpSequence = (rtpSequence + 1) and 0xFFFF
                 rtpTimestamp += FRAMES_PER_PACKET
@@ -483,8 +535,10 @@ class RaopClient(
             "Content-Type" to "text/parameters",
             "Content-Length" to volumeStr.length.toString()
         )
-        sendRtspRequestDirect("SET_PARAMETER", "rtsp://$localIp/$localSessionId", headers, volumeStr.toByteArray(Charsets.ISO_8859_1))
-        parseRtspResponse()?.first == 200
+        synchronized(rtspLock) {
+            sendRtspRequestDirect("SET_PARAMETER", "rtsp://$localIp/$localSessionId", headers, volumeStr.toByteArray(Charsets.ISO_8859_1))
+            parseRtspResponse()?.first == 200
+        }
     }
 
     suspend fun disconnect() = withContext(Dispatchers.IO) {
@@ -497,9 +551,11 @@ class RaopClient(
         
         if (wasConnected) {
             try {
-                rtspSocket?.soTimeout = 2000
-                sendRtspRequestDirect("TEARDOWN", "rtsp://$localIp/$localSessionId", emptyMap(), sessionId = serverSessionId)
-                parseRtspResponse()
+                synchronized(rtspLock) {
+                    rtspSocket?.soTimeout = 2000
+                    sendRtspRequestDirect("TEARDOWN", "rtsp://$localIp/$localSessionId", emptyMap(), sessionId = serverSessionId)
+                    parseRtspResponse()
+                }
             } catch (e: Exception) {}
         }
         
@@ -564,7 +620,9 @@ class RaopClient(
     private val supportedEncryptionTypes: Set<Int> =
         RaopCapabilities.encryptionTypes(deviceFeatures).ifEmpty { setOf(0, 1) }
     private val useFairPlayStub = RaopCapabilities.requiresUnsupportedFairPlay(deviceFeatures)
+    private val useMfiAuthSetup = RaopCapabilities.requiresMfiAuthSetup(deviceFeatures)
     private var useEncryption = 1 in supportedEncryptionTypes
+    private val useAlac = useFairPlayStub || (useMfiAuthSetup && !useEncryption)
 
     private fun buildSdp(localIp: String, rsaAesKey: String?, aesIvBase64: String?): String {
         val base = "v=0\r\no=iTunes $localSessionId 0 IN IP4 $localIp\r\ns=iTunes\r\nc=IN IP4 $host\r\nt=0 0\r\nm=audio 0 RTP/AVP 96"
@@ -573,6 +631,9 @@ class RaopClient(
             val dummyAesIv = Base64.getEncoder().encodeToString(aesIv ?: ByteArray(16))
             logD("FairPlay et=5 receiver; announcing ALAC with dummy fpaeskey")
             "$base\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\na=fpaeskey:$dummyFpAesKey\r\na=aesiv:$dummyAesIv\r\n"
+        } else if (useAlac) {
+            logD("MFiSAP receiver; announcing unencrypted AppleLossless")
+            "$base\r\na=rtpmap:96 AppleLossless\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n"
         } else if (useEncryption) {
             "$base\r\na=rtpmap:96 L16/44100/2\r\na=rsaaeskey:$rsaAesKey\r\na=aesiv:$aesIvBase64\r\n"
         } else {
@@ -591,9 +652,9 @@ class RaopClient(
         return Base64.getEncoder().encodeToString(data)
     }
 
-    private fun buildRtpPacket(data: ByteArray): ByteArray {
+    private fun buildRtpPacket(data: ByteArray, firstPacket: Boolean): ByteArray {
         val h = ByteArray(12)
-        h[0] = 0x80.toByte(); h[1] = 0x60.toByte()
+        h[0] = 0x80.toByte(); h[1] = if (firstPacket) 0xe0.toByte() else 0x60.toByte()
         h[2] = (rtpSequence shr 8).toByte(); h[3] = rtpSequence.toByte()
         h[4] = (rtpTimestamp shr 24).toByte(); h[5] = (rtpTimestamp shr 16).toByte()
         h[6] = (rtpTimestamp shr 8).toByte(); h[7] = rtpTimestamp.toByte()
@@ -632,6 +693,9 @@ class RaopClient(
                 while (isTimingRunning.get() && !socket.isClosed) {
                     socket.receive(packet)
                     if (packet.length >= 32) {
+                        if (loggedFirstTimingRequest.compareAndSet(false, true)) {
+                            logD("First timing request from ${packet.address.hostAddress}:${packet.port} for $host")
+                        }
                         val req = packet.data; val resp = ByteArray(packet.length)
                         System.arraycopy(req, 0, resp, 0, 8)
                         resp[1] = (0x53 or 0x80).toByte()
@@ -658,7 +722,8 @@ class RaopClient(
         if (serverControlPort == 0) return
         isSyncRunning.set(true)
         val latencyMs = 2500L; val latencySamples = (latencyMs * SAMPLE_RATE / 1000)
-        val startRtp = rtpTimestamp; val startTime = System.currentTimeMillis()
+        val startRtp = streamClock?.initialRtpTimestamp ?: rtpTimestamp
+        val startTime = streamClock?.epochMs ?: System.currentTimeMillis()
         Thread {
             try {
                 val addr = InetAddress.getByName(host); var lastSync = 0L
@@ -670,6 +735,9 @@ class RaopClient(
                         val playTime = now + latencyMs
                         val syncPacket = buildSyncPacket(curPlayRtp, playTime, latencySamples)
                         socket.send(DatagramPacket(syncPacket, syncPacket.size, addr, serverControlPort))
+                        if (loggedFirstSyncPacket.compareAndSet(false, true)) {
+                            logD("First sync packet to $host:$serverControlPort: rtptime=$curPlayRtp")
+                        }
                         syncSequence++; lastSync = now
                     }
                     Thread.sleep(50)
@@ -702,11 +770,17 @@ class RaopClient(
                     val s = rtspSocket
                     if (s == null || s.isClosed || !s.isConnected) { handleServerDisconnect(); break }
                     try {
-                        s.soTimeout = 100
-                        if (s.getInputStream().read() == -1) { handleServerDisconnect(); break }
+                        synchronized(rtspLock) {
+                            val previousTimeout = s.soTimeout
+                            try {
+                                s.soTimeout = 100
+                                if (s.getInputStream().read() == -1) { handleServerDisconnect(); return@Thread }
+                            } finally {
+                                s.soTimeout = previousTimeout
+                            }
+                        }
                     } catch (e: java.net.SocketTimeoutException) {
                     } catch (e: Exception) { handleServerDisconnect(); break }
-                    finally { try { s.soTimeout = 10000 } catch (e: Exception) {} }
                 }
             } catch (e: Exception) {}
         }.start()
